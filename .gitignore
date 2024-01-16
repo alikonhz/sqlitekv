@@ -22,3 +22,6 @@ go.work
 
 # GoLand files
 .idea
+
+# sqlite db
+*.sqlite*

@@ -26,14 +26,49 @@ var (
 )
 
 const (
-	createTable = "CREATE TABLE IF NOT EXISTS kvstore (key TEXT PRIMARY KEY, value BLOB NULL)"
-	insertSql   = "INSERT INTO kvstore (key, value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-	selectSql   = "SELECT value FROM kvstore WHERE key = ?"
+	createTable = "CREATE TABLE IF NOT EXISTS kvstore (key TEXT PRIMARY KEY, value BLOB NULL, type TEXT NOT NULL)"
+	insertSql   = "INSERT INTO kvstore (key, value, type) VALUES (?,?,?) ON CONFLICT (key) DO UPDATE SET value = excluded.value, type = excluded.type"
+	selectSql   = "SELECT value, type FROM kvstore WHERE key = ?"
 )
 
+type KvType string
+
+const (
+	StringType  KvType = "S"
+	Float64Type KvType = "F64"
+	Float32Type KvType = "F32"
+	Int32Type   KvType = "I32"
+	Int64Type   KvType = "I64"
+	BinaryType  KvType = "BLOB" // blob
+	UnknownType KvType = "-"
+)
+
+type KvValue struct {
+	Value []byte
+	Type  KvType
+}
+
+func (kv *KvValue) String() string {
+	return fmt.Sprintf("%+v (%s)", kv.Value, kv.Type)
+}
+
+func KvBinary(value []byte) *KvValue {
+	return &KvValue{
+		Value: value,
+		Type:  BinaryType,
+	}
+}
+
+func KvString(value string) *KvValue {
+	return &KvValue{
+		Value: []byte(value),
+		Type:  StringType,
+	}
+}
+
 type KvStore interface {
-	Get(ctx context.Context, key string) ([]byte, error)
-	Set(ctx context.Context, key string, value []byte) error
+	Get(ctx context.Context, key string) (*KvValue, error)
+	Set(ctx context.Context, key string, value *KvValue) error
 }
 
 type SqliteStorage struct {
@@ -108,7 +143,7 @@ func runStmt(conn *sqlite.Conn, query string) error {
 	return nil
 }
 
-func (s *SqliteStorage) Get(ctx context.Context, key string) ([]byte, error) {
+func (s *SqliteStorage) Get(ctx context.Context, key string) (*KvValue, error) {
 	respChan := make(chan workerResponse)
 	r := &workerRequest{
 		ctx:      ctx,
@@ -126,7 +161,7 @@ func (s *SqliteStorage) Get(ctx context.Context, key string) ([]byte, error) {
 	return s.waitForResp(r)
 }
 
-func (s *SqliteStorage) Set(ctx context.Context, key string, value []byte) error {
+func (s *SqliteStorage) Set(ctx context.Context, key string, value *KvValue) error {
 	respChan := make(chan workerResponse)
 	r := &workerRequest{
 		ctx:      ctx,
@@ -162,7 +197,7 @@ func (s *SqliteStorage) getWorker(key string) *worker {
 	return s.workerPool[wIndex]
 }
 
-func (s *SqliteStorage) waitForResp(r *workerRequest) ([]byte, error) {
+func (s *SqliteStorage) waitForResp(r *workerRequest) (*KvValue, error) {
 	defer close(r.respChan)
 
 	select {
@@ -228,14 +263,14 @@ type worker struct {
 }
 
 type workerResponse struct {
-	value []byte
+	value *KvValue
 	err   error
 }
 
 type workerRequest struct {
 	ctx      context.Context
 	key      string
-	value    []byte
+	value    *KvValue
 	op       opCode
 	respChan chan workerResponse
 }
@@ -263,7 +298,7 @@ func (w *worker) process() {
 	}
 }
 
-func (w *worker) set(ctx context.Context, key string, value []byte, respChan chan workerResponse) {
+func (w *worker) set(ctx context.Context, key string, value *KvValue, respChan chan workerResponse) {
 	err := withConnRetry(ctx, w.dbPool, func(conn *sqlite.Conn) error {
 		stmt, err := conn.Prepare(insertSql)
 		if err != nil {
@@ -273,10 +308,11 @@ func (w *worker) set(ctx context.Context, key string, value []byte, respChan cha
 		defer stmt.Finalize()
 		stmt.BindText(1, key)
 		if value != nil {
-			stmt.BindBytes(2, value)
+			stmt.BindBytes(2, value.Value)
 		} else {
 			stmt.BindNull(2)
 		}
+		stmt.BindText(3, string(value.Type))
 
 		_, err = stmt.Step()
 		return err
@@ -311,7 +347,7 @@ func reply(respChan chan workerResponse, op opCode, key string, err error) {
 }
 
 func (w *worker) get(ctx context.Context, key string, respChan chan workerResponse) {
-	res, err := withConnRes(ctx, w.dbPool, func(conn *sqlite.Conn) ([]byte, error) {
+	res, err := withConnRes(ctx, w.dbPool, func(conn *sqlite.Conn) (*KvValue, error) {
 		stmt, err := conn.Prepare(selectSql)
 		if err != nil {
 			return nil, err
@@ -328,14 +364,25 @@ func (w *worker) get(ctx context.Context, key string, respChan chan workerRespon
 			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, key)
 		}
 
-		reader := stmt.GetReader("value")
-		res := make([]byte, reader.Len())
-		_, err = reader.Read(res)
+		valRdr := stmt.GetReader("value")
+		val := make([]byte, valRdr.Len())
+		_, err = valRdr.Read(val)
 		if err != nil {
 			return nil, err
 		}
 
-		return res, nil
+		typeRdr := stmt.GetReader("type")
+		typeVal := make([]byte, typeRdr.Len())
+		_, err = typeRdr.Read(typeVal)
+		if err != nil {
+			return nil, err
+		}
+
+		rowType := KvType(typeVal)
+		return &KvValue{
+			Value: val,
+			Type:  rowType,
+		}, nil
 	}, 10)
 
 	if err != nil {

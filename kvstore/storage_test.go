@@ -21,7 +21,7 @@ func BenchmarkSet(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		val := []byte(fmt.Sprintf("value-%d", i))
+		val := KvString(fmt.Sprintf("value-%d", i))
 
 		err = s.Set(context.Background(), key, val)
 	}
@@ -42,7 +42,7 @@ func TestConcurrentSet(t *testing.T) {
 	)
 
 	// ignore the error
-	s.Set(context.Background(), key, []byte("value"))
+	s.Set(context.Background(), key, KvString("value"))
 
 	values := generateValues(count)
 
@@ -57,7 +57,7 @@ func TestConcurrentSet(t *testing.T) {
 		for i := 0; i < count; i++ {
 			i := i
 			go func() {
-				err := s.Set(context.Background(), key, values[i])
+				err := s.Set(context.Background(), key, KvString(values[i]))
 				assert.NoError(t, err)
 				writeChan <- i
 
@@ -76,7 +76,7 @@ func TestConcurrentSet(t *testing.T) {
 	doneChan := make(chan struct{})
 	defer close(doneChan)
 
-	var readVal string
+	var readVal *KvValue
 	go func() {
 		// wait until half of the workers sent Set requests
 		<-halfChan
@@ -86,7 +86,7 @@ func TestConcurrentSet(t *testing.T) {
 		// and should return the latest value
 		val, err := s.Get(context.Background(), key)
 		assert.NoError(t, err)
-		readVal = string(val)
+		readVal = val
 		doneChan <- struct{}{}
 	}()
 
@@ -98,14 +98,14 @@ func TestConcurrentSet(t *testing.T) {
 		lastWritten = i
 	}
 
-	assert.Equal(t, fmt.Sprintf("value-%d", lastWritten), readVal)
+	extracted, _ := ConvertFromValue(readVal)
+	assert.Equal(t, fmt.Sprintf("value-%d", lastWritten), extracted)
 }
 
-func generateValues(count int) [][]byte {
-	values := make([][]byte, count)
+func generateValues(count int) []string {
+	values := make([]string, count)
 	for i := 0; i < count; i++ {
-		val := []byte(fmt.Sprintf("value-%d", i))
-		values[i] = val
+		values[i] = fmt.Sprintf("value-%d", i)
 	}
 
 	return values
@@ -128,16 +128,17 @@ func TestSetSameKey(t *testing.T) {
 
 	const key = "key"
 	value := []byte{1, 2, 3}
-	err := s.Set(context.Background(), key, value)
+	err := s.Set(context.Background(), key, KvBinary(value))
 	assert.NoError(t, err)
 
 	newValue := []byte{1, 2, 3, 4}
-	err = s.Set(context.Background(), key, newValue)
+	err = s.Set(context.Background(), key, KvBinary(newValue))
 	assert.NoError(t, err)
 
 	got, err := s.Get(context.Background(), key)
 	assert.NoError(t, err)
-	assert.Equal(t, newValue, got)
+	assert.Equal(t, newValue, got.Value)
+	assert.Equal(t, BinaryType, got.Type)
 }
 
 func TestSetGet(t *testing.T) {
@@ -145,16 +146,50 @@ func TestSetGet(t *testing.T) {
 	s := mustCreateKvStore(t, fileName)
 	defer s.Close()
 
-	const key = "key"
-	value := []byte{1, 2, 3, 4}
+	runTypeTest[int32](t, "int32 type", s, "keyint32", 123)
+	runTypeTest[int64](t, "int64 type", s, "keyint64", 981238917398)
+	runTypeTest[float32](t, "float32 type", s, "keyfloat32", 7162.12398)
+	runTypeTest[float64](t, "float64 type", s, "keyfloat64", 716219878712341249.123981092381)
+	runTypeTest[string](t, "string type", s, "keystring", "this is string")
+	runTypeTest[[]byte](t, "[]byte type", s, "keybyte", []byte{1, 2, 3, 4, 5})
 
-	err := s.Set(context.Background(), key, value)
-	assert.NoError(t, err)
+	t.Run("int type", func(t *testing.T) {
+		var i int = 182878
 
-	got, err := s.Get(context.Background(), key)
-	assert.NoError(t, err)
+		key := "keyint"
+		kv, err := ConvertToValue(i)
+		assert.NoError(t, err)
 
-	assert.Equal(t, value, got)
+		err = s.Set(context.Background(), key, kv)
+		assert.NoError(t, err)
+
+		got, err := s.Get(context.Background(), key)
+		assert.NoError(t, err)
+
+		v, err := ConvertFromValue(got)
+		assert.NoError(t, err)
+
+		// int will be stored as int64
+		assert.Equal(t, int64(i), v)
+	})
+}
+
+func runTypeTest[T any](t *testing.T, testName string, s *SqliteStorage, key string, val T) {
+	t.Run(testName, func(t *testing.T) {
+		kv, err := ConvertToValue(val)
+		assert.NoError(t, err)
+
+		err = s.Set(context.Background(), key, kv)
+		assert.NoError(t, err)
+
+		got, err := s.Get(context.Background(), key)
+		assert.NoError(t, err)
+
+		v, err := ConvertFromValue(got)
+		assert.NoError(t, err)
+
+		assert.Equal(t, val, v)
+	})
 }
 
 func mustCreateKvStore(t *testing.T, fileName string) *SqliteStorage {
